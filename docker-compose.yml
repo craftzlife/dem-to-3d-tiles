@@ -1,0 +1,18 @@
+services:
+  dem2tiles:
+    build: .
+    volumes:
+      - ./data/raw:/app/data/raw:ro
+      - ./data/processed:/app/data/processed
+      - ./src:/app/src
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["process", "--input-dir", "/app/data/raw", "--output-dir", "/app/data/processed"]
+
+  test:
+    build: .
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+    entrypoint: ["python3", "-m", "pytest"]
+    command: ["-v", "tests/"]
