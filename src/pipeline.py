@@ -8,9 +8,14 @@ Only generates tiles for cells that overlap with available DEM data.
 from __future__ import annotations
 
 import logging
+import multiprocessing
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 from tqdm import tqdm
 
 from .config import (
@@ -21,7 +26,7 @@ from .config import (
     NUM_FACES,
     SPHERE_RADIUS,
 )
-from .cube_sphere import face_uv_to_latlng
+from .cube_sphere import face_uv_to_latlng_batch
 from .dem_reader import DEMReader
 from .heightmap_generator import generate_cell_heightmap
 from .quadtree import Cell, iter_cells_at_level
@@ -29,37 +34,72 @@ from .tile_writer import write_manifest, write_tile
 
 logger = logging.getLogger(__name__)
 
+# Process-local DEMReader for workers (populated by _init_worker)
+_worker_dem_reader: DEMReader | None = None
+
+
+def _init_worker(input_dir: str) -> None:
+    """Pool initializer: create a process-local DEMReader (no shared state)."""
+    global _worker_dem_reader
+    _worker_dem_reader = DEMReader(input_dir)
+    # Note: no atexit needed — ProcessPoolExecutor workers exit via os._exit(0),
+    # which bypasses Python cleanup (and stuck GDAL background threads).
+
+
+def _process_cell(args: tuple[Any, ...]) -> dict | None:
+    """
+    Module-level, picklable worker function.
+
+    Processes one cell end-to-end: bounds check → heightmap → tile write.
+    Returns a manifest entry dict, or None if the cell was skipped.
+    """
+    cell, output_dir_str, resolution = args
+    output_dir = Path(output_dir_str)
+
+    dem_reader = _worker_dem_reader
+    assert dem_reader is not None, "Worker DEMReader not initialized"
+
+    # Bounds check
+    lat_min, lat_max, lon_min, lon_max = _cell_latlng_bounds(cell)
+    if not dem_reader.has_data_in_region(lat_min, lat_max, lon_min, lon_max):
+        return None
+
+    # Generate and write heightmap
+    heightmap = generate_cell_heightmap(cell, dem_reader, resolution=resolution)
+    tile_path = write_tile(heightmap, cell, output_dir)
+
+    return {
+        "face": cell.face,
+        "level": cell.level,
+        "ix": cell.ix,
+        "iy": cell.iy,
+        "path": str(tile_path.relative_to(output_dir)),
+        "elevation_min": round(heightmap.elevation_min, 2),
+        "elevation_max": round(heightmap.elevation_max, 2),
+        "elevation_mean": round(heightmap.elevation_mean, 2),
+    }
+
 
 def _cell_latlng_bounds(cell: Cell) -> tuple[float, float, float, float]:
     """
     Get approximate lat/lon bounds for a cell by sampling its corners and edges.
 
+    Uses vectorized face_uv_to_latlng_batch for a single batch call instead of
+    9 individual scalar calls.
+
     Returns (lat_min, lat_max, lon_min, lon_max).
     """
     u_min, u_max = cell.u_range
     v_min, v_max = cell.v_range
+    u_mid = (u_min + u_max) / 2
+    v_mid = (v_min + v_max) / 2
 
-    # Sample corners and edge midpoints for better bounds estimation
-    sample_points = [
-        (u_min, v_min),
-        (u_max, v_min),
-        (u_min, v_max),
-        (u_max, v_max),
-        ((u_min + u_max) / 2, v_min),
-        ((u_min + u_max) / 2, v_max),
-        (u_min, (v_min + v_max) / 2),
-        (u_max, (v_min + v_max) / 2),
-        ((u_min + u_max) / 2, (v_min + v_max) / 2),
-    ]
+    us = np.array([u_min, u_max, u_min, u_max, u_mid, u_mid, u_min, u_max, u_mid])
+    vs = np.array([v_min, v_min, v_max, v_max, v_min, v_max, v_mid, v_mid, v_mid])
 
-    lats = []
-    lons = []
-    for u, v in sample_points:
-        lat, lon = face_uv_to_latlng(cell.face, u, v)
-        lats.append(lat)
-        lons.append(lon)
+    lats, lons = face_uv_to_latlng_batch(cell.face, us, vs)
 
-    return min(lats), max(lats), min(lons), max(lons)
+    return float(lats.min()), float(lats.max()), float(lons.min()), float(lons.max())
 
 
 def run_pipeline(
@@ -70,6 +110,7 @@ def run_pipeline(
     resolution: int = MESH_RESOLUTION,
     sphere_radius: float = SPHERE_RADIUS,
     faces: list[int] | None = None,
+    num_workers: int | None = None,
 ) -> dict:
     """
     Run the full DEM-to-tiles pipeline.
@@ -82,6 +123,8 @@ def run_pipeline(
         resolution: Heightmap resolution (pixels per cell edge).
         sphere_radius: Output sphere radius (stored in manifest for Unity).
         faces: List of face indices to process (default: all 6).
+        num_workers: Number of parallel worker processes. Defaults to
+            min(os.cpu_count(), 8). Use 1 for sequential/debug mode.
 
     Returns:
         Manifest dictionary with tile hierarchy metadata.
@@ -93,68 +136,70 @@ def run_pipeline(
     if faces is None:
         faces = list(range(NUM_FACES))
 
+    if num_workers is None:
+        num_workers = min(os.cpu_count() or 1, 8)
+
     logger.info(f"Input: {input_dir}")
     logger.info(f"Output: {output_dir}")
     logger.info(f"LOD range: {min_lod}-{max_lod}, Resolution: {resolution}")
     logger.info(f"Faces: {faces}")
+    logger.info(f"Workers: {num_workers}")
 
     start_time = time.time()
 
-    with DEMReader(input_dir) as dem_reader:
-        dem_bounds = dem_reader.bounds
-        if dem_bounds is None:
-            logger.error("No DEM data found!")
-            return {"tiles": [], "error": "No DEM data found"}
+    # Build full work list, sorted by face+level for spatial locality
+    all_cells: list[Cell] = []
+    for level in range(min_lod, max_lod + 1):
+        for face in faces:
+            all_cells.extend(iter_cells_at_level(face, level))
+    all_cells.sort(key=lambda c: (c.face, c.level, c.iy, c.ix))
 
-        logger.info(
-            f"DEM bounds: lat [{dem_bounds[0]:.2f}, {dem_bounds[1]:.2f}], "
-            f"lon [{dem_bounds[2]:.2f}, {dem_bounds[3]:.2f}]"
-        )
+    output_dir_str = str(output_dir)
+    work_args = [(cell, output_dir_str, resolution) for cell in all_cells]
 
-        manifest_tiles = []
-        total_generated = 0
-        total_skipped = 0
+    manifest_tiles: list[dict] = []
+    total_generated = 0
+    total_skipped = 0
 
-        for level in range(min_lod, max_lod + 1):
-            level_generated = 0
-            cells = []
-            for face in faces:
-                cells.extend(iter_cells_at_level(face, level))
-
-            desc = f"LOD {level} ({len(cells)} cells)"
-            for cell in tqdm(cells, desc=desc, leave=True):
-                # Check if cell overlaps with DEM data
-                lat_min, lat_max, lon_min, lon_max = _cell_latlng_bounds(cell)
-                if not dem_reader.has_data_in_region(
-                    lat_min, lat_max, lon_min, lon_max
-                ):
+    if num_workers == 1:
+        # Sequential mode for debugging: use a single in-process DEMReader
+        with DEMReader(input_dir) as dem_reader:
+            # Temporarily patch the global so _process_cell works correctly
+            global _worker_dem_reader
+            _worker_dem_reader = dem_reader
+            for args in tqdm(work_args, desc="Processing cells"):
+                result = _process_cell(args)
+                if result is None:
                     total_skipped += 1
-                    continue
-
-                # Generate and write heightmap
-                heightmap = generate_cell_heightmap(
-                    cell,
-                    dem_reader,
-                    resolution=resolution,
-                )
-                tile_path = write_tile(heightmap, cell, output_dir)
-
-                manifest_tiles.append(
-                    {
-                        "face": cell.face,
-                        "level": cell.level,
-                        "ix": cell.ix,
-                        "iy": cell.iy,
-                        "path": str(tile_path.relative_to(output_dir)),
-                        "elevation_min": round(heightmap.elevation_min, 2),
-                        "elevation_max": round(heightmap.elevation_max, 2),
-                        "elevation_mean": round(heightmap.elevation_mean, 2),
-                    }
-                )
-                level_generated += 1
-                total_generated += 1
-
-            logger.info(f"LOD {level}: generated {level_generated} tiles")
+                else:
+                    manifest_tiles.append(result)
+                    total_generated += 1
+            _worker_dem_reader = None
+    else:
+        ctx = multiprocessing.get_context("spawn")
+        # chunksize batches work per IPC round-trip; 64 balances latency vs memory.
+        # executor.map() is lazy — unlike submit(), it does NOT pre-allocate
+        # millions of Future objects, so tqdm starts updating immediately.
+        chunksize = max(1, len(work_args) // (num_workers * 16))
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=ctx,
+            initializer=_init_worker,
+            initargs=(str(input_dir),),
+        ) as executor:
+            for result in tqdm(
+                executor.map(_process_cell, work_args, chunksize=chunksize),
+                total=len(work_args),
+                desc="Processing cells",
+            ):
+                if result is None:
+                    total_skipped += 1
+                else:
+                    manifest_tiles.append(result)
+                    total_generated += 1
+        # ProcessPoolExecutor.__exit__ calls shutdown(wait=True) which sends a
+        # sentinel to each worker causing them to call os._exit(0), cleanly
+        # bypassing any stuck GDAL C-level background threads.
 
     elapsed = time.time() - start_time
     logger.info(

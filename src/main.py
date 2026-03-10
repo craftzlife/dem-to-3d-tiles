@@ -1,6 +1,7 @@
 """CLI entry point for DEM to 3D tiles pipeline."""
 
 import logging
+import os
 
 import click
 
@@ -53,6 +54,16 @@ def cli(verbose: bool):
     default=None,
     help="Comma-separated face indices to process (e.g., '0,1,2'). Default: all.",
 )
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help=(
+        "Number of parallel worker processes. "
+        f"Defaults to min(cpu_count, 8) = {min(os.cpu_count() or 1, 8)}. "
+        "Use 1 for sequential/debug mode."
+    ),
+)
 def process(
     input_dir: str,
     output_dir: str,
@@ -61,6 +72,7 @@ def process(
     resolution: int,
     sphere_radius: float,
     faces: str | None,
+    workers: int | None,
 ):
     """Process DEM data into cube-sphere terrain heightmap tiles."""
     face_list = None
@@ -75,6 +87,7 @@ def process(
         resolution=resolution,
         sphere_radius=sphere_radius,
         faces=face_list,
+        num_workers=workers,
     )
 
 

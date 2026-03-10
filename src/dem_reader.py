@@ -8,8 +8,10 @@ and provides elevation lookup by lat/lon coordinates.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import numpy as np
 import rasterio
@@ -41,6 +43,10 @@ class DEMReader:
         self.input_dir = Path(input_dir)
         self.tiles: list[TileInfo] = []
         self._open_datasets: dict[Path, rasterio.DatasetReader] = {}
+        # Band cache: stores the full elevation array for each opened tile path
+        self._band_cache: dict[Path, np.ndarray] = {}
+        # Spatial index: (floor_lat, floor_lon) -> list of TileInfo
+        self._spatial_index: dict[tuple[int, int], list[TileInfo]] = {}
         self._index_tiles()
 
     def _index_tiles(self):
@@ -70,6 +76,27 @@ class DEMReader:
                 logger.warning(f"Failed to read {tif_path}: {e}")
 
         logger.info(f"Indexed {len(self.tiles)} DEM tiles")
+        self._build_spatial_index()
+
+    def _build_spatial_index(self):
+        """
+        Build a spatial index from integer (floor_lat, floor_lon) keys to tiles.
+
+        Copernicus DEM tiles are typically 1°×1° so each tile is reliably
+        addressable by the integer floor of its lat/lon min corner. Tiles
+        spanning more than one degree cell are added to all covered cells.
+        """
+        index: dict[tuple[int, int], list[TileInfo]] = {}
+        for tile in self.tiles:
+            lat_lo = math.floor(tile.lat_min)
+            lat_hi = math.floor(tile.lat_max)
+            lon_lo = math.floor(tile.lon_min)
+            lon_hi = math.floor(tile.lon_max)
+            for lat_cell in range(lat_lo, lat_hi + 1):
+                for lon_cell in range(lon_lo, lon_hi + 1):
+                    key = (lat_cell, lon_cell)
+                    index.setdefault(key, []).append(tile)
+        self._spatial_index = index
 
     @property
     def bounds(self) -> tuple[float, float, float, float] | None:
@@ -84,8 +111,12 @@ class DEMReader:
         )
 
     def _find_tile(self, lat: float, lon: float) -> TileInfo | None:
-        """Find the tile containing the given lat/lon."""
-        for tile in self.tiles:
+        """Find the tile containing the given lat/lon using spatial index (O(1))."""
+        key = (math.floor(lat), math.floor(lon))
+        candidates = self._spatial_index.get(key)
+        if candidates is None:
+            return None
+        for tile in candidates:
             if (
                 tile.lat_min <= lat <= tile.lat_max
                 and tile.lon_min <= lon <= tile.lon_max
@@ -98,6 +129,18 @@ class DEMReader:
         if tile.path not in self._open_datasets:
             self._open_datasets[tile.path] = rasterio.open(tile.path)
         return self._open_datasets[tile.path]
+
+    def _get_band(self, tile: TileInfo) -> np.ndarray:
+        """
+        Return the full elevation band for a tile, reading and caching on first access.
+
+        Each tile is ~49 MB (3601×3601 float32). Adjacent cells frequently share
+        the same tile, so caching avoids repeated full-band reads.
+        """
+        if tile.path not in self._band_cache:
+            ds = self._get_dataset(tile)
+            self._band_cache[tile.path] = ds.read(1)
+        return self._band_cache[tile.path]
 
     def get_elevation(self, lat: float, lon: float) -> float:
         """Get elevation at a single lat/lon point. Returns 0.0 if no data."""
@@ -117,39 +160,104 @@ class DEMReader:
 
     def get_elevations(self, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
         """
-        Get elevations for arrays of lat/lon coordinates.
+        Get elevations for arrays of lat/lon coordinates (vectorized).
+
+        Groups coordinates by source tile, performs a single numpy index into the
+        cached band per tile, and eliminates the per-pixel Python loop entirely.
 
         Returns array of elevations in meters. Missing data returns 0.0.
         """
-        elevations = np.zeros(lats.shape, dtype=np.float64)
+        result = np.zeros(lats.shape, dtype=np.float64)
         flat_lats = lats.ravel()
         flat_lons = lons.ravel()
-        flat_elevs = elevations.ravel()
+        flat_result = result.ravel()
 
-        for i in range(len(flat_lats)):
-            flat_elevs[i] = self.get_elevation(flat_lats[i], flat_lons[i])
+        # Group coordinate indices by their source tile using vectorized floor
+        floor_lats = np.floor(flat_lats).astype(np.int32)
+        floor_lons = np.floor(flat_lons).astype(np.int32)
 
-        return flat_elevs.reshape(lats.shape)
+        # Unique spatial-index keys present in this batch
+        keys = set(zip(floor_lats.tolist(), floor_lons.tolist()))
+
+        for key in keys:
+            # Gather candidates from spatial index
+            candidates = self._spatial_index.get(key, [])
+            if not candidates:
+                continue
+
+            # Mask of coordinates falling in this index cell
+            cell_mask = (floor_lats == key[0]) & (floor_lons == key[1])
+            indices = np.where(cell_mask)[0]
+
+            cell_lats = flat_lats[indices]
+            cell_lons = flat_lons[indices]
+
+            # Route each coordinate to its actual tile (usually just one)
+            for tile in candidates:
+                tile_mask = (
+                    (cell_lats >= tile.lat_min) & (cell_lats <= tile.lat_max)
+                    & (cell_lons >= tile.lon_min) & (cell_lons <= tile.lon_max)
+                )
+                if not np.any(tile_mask):
+                    continue
+
+                tile_indices = indices[tile_mask]
+                t_lats = flat_lats[tile_indices]
+                t_lons = flat_lons[tile_indices]
+
+                # Batch rowcol transform
+                ds = self._get_dataset(tile)
+                rows, cols = rowcol(ds.transform, t_lons, t_lats)
+                rows = np.asarray(rows, dtype=np.int32)
+                cols = np.asarray(cols, dtype=np.int32)
+
+                # Clamp to valid range
+                valid = (rows >= 0) & (rows < tile.height) & (cols >= 0) & (cols < tile.width)
+
+                if np.any(valid):
+                    band = self._get_band(tile)
+                    v_rows = rows[valid]
+                    v_cols = cols[valid]
+                    vals = band[v_rows, v_cols].astype(np.float64)
+
+                    # Replace nodata / NaN with 0
+                    vals = np.where(
+                        (vals == DEM_NODATA) | np.isnan(vals), 0.0, vals
+                    )
+                    flat_result[tile_indices[valid]] = vals
+
+        return flat_result.reshape(lats.shape)
 
     def has_data_in_region(
         self, lat_min: float, lat_max: float, lon_min: float, lon_max: float
     ) -> bool:
-        """Check if any DEM tile overlaps the given geographic region."""
-        for tile in self.tiles:
-            if (
-                tile.lat_max >= lat_min
-                and tile.lat_min <= lat_max
-                and tile.lon_max >= lon_min
-                and tile.lon_min <= lon_max
-            ):
-                return True
+        """Check if any DEM tile overlaps the given geographic region using spatial index."""
+        lat_lo = math.floor(lat_min)
+        lat_hi = math.floor(lat_max)
+        lon_lo = math.floor(lon_min)
+        lon_hi = math.floor(lon_max)
+
+        for lat_cell in range(lat_lo, lat_hi + 1):
+            for lon_cell in range(lon_lo, lon_hi + 1):
+                candidates = self._spatial_index.get((lat_cell, lon_cell))
+                if candidates is None:
+                    continue
+                for tile in candidates:
+                    if (
+                        tile.lat_max >= lat_min
+                        and tile.lat_min <= lat_max
+                        and tile.lon_max >= lon_min
+                        and tile.lon_min <= lon_max
+                    ):
+                        return True
         return False
 
     def close(self):
-        """Close all open datasets."""
+        """Close all open datasets and clear caches."""
         for ds in self._open_datasets.values():
             ds.close()
         self._open_datasets.clear()
+        self._band_cache.clear()
 
     def __enter__(self):
         return self
