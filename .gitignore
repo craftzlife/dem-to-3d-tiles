@@ -12,8 +12,7 @@ build/
 venv/
 *.tif
 *.tiff
-data/processed/
-data/raw/
+data/
 *.obj
 *.ply
 *.json
