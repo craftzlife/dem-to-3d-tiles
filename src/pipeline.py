@@ -59,10 +59,19 @@ def _process_cell(args: tuple[Any, ...]) -> dict | None:
     dem_reader = _worker_dem_reader
     assert dem_reader is not None, "Worker DEMReader not initialized"
 
-    # Bounds check
-    lat_min, lat_max, lon_min, lon_max = _cell_latlng_bounds(cell)
-    if not dem_reader.has_data_in_region(lat_min, lat_max, lon_min, lon_max):
-        return None
+    # Bounds check (may return 6-tuple for antimeridian-crossing cells)
+    bounds = _cell_latlng_bounds(cell)
+    if len(bounds) == 6:
+        lat_min, lat_max, lon_min1, lon_max1, lon_min2, lon_max2 = bounds
+        if not (
+            dem_reader.has_data_in_region(lat_min, lat_max, lon_min1, lon_max1)
+            or dem_reader.has_data_in_region(lat_min, lat_max, lon_min2, lon_max2)
+        ):
+            return None
+    else:
+        lat_min, lat_max, lon_min, lon_max = bounds
+        if not dem_reader.has_data_in_region(lat_min, lat_max, lon_min, lon_max):
+            return None
 
     # Generate and write heightmap
     heightmap = generate_cell_heightmap(cell, dem_reader, resolution=resolution)
@@ -80,14 +89,18 @@ def _process_cell(args: tuple[Any, ...]) -> dict | None:
     }
 
 
-def _cell_latlng_bounds(cell: Cell) -> tuple[float, float, float, float]:
+def _cell_latlng_bounds(
+    cell: Cell,
+) -> tuple[float, float, float, float] | tuple[float, float, float, float, float, float]:
     """
     Get approximate lat/lon bounds for a cell by sampling its corners and edges.
 
     Uses vectorized face_uv_to_latlng_batch for a single batch call instead of
     9 individual scalar calls.
 
-    Returns (lat_min, lat_max, lon_min, lon_max).
+    Returns (lat_min, lat_max, lon_min, lon_max) normally, or
+    (lat_min, lat_max, lon_min1, lon_max1, lon_min2, lon_max2) when the cell
+    crosses the antimeridian (split into two longitude ranges).
     """
     u_min, u_max = cell.u_range
     v_min, v_max = cell.v_range
@@ -99,7 +112,22 @@ def _cell_latlng_bounds(cell: Cell) -> tuple[float, float, float, float]:
 
     lats, lons = face_uv_to_latlng_batch(cell.face, us, vs)
 
-    return float(lats.min()), float(lats.max()), float(lons.min()), float(lons.max())
+    lat_min, lat_max = float(lats.min()), float(lats.max())
+
+    # Detect antimeridian crossing: if any pair of sampled longitudes differs
+    # by more than 180°, the cell straddles the ±180° boundary.
+    lon_span = float(lons.max()) - float(lons.min())
+    if lon_span > 180.0:
+        # Split into two ranges: [min_positive, 180] and [-180, max_negative]
+        positive = lons[lons >= 0]
+        negative = lons[lons < 0]
+        return (
+            lat_min, lat_max,
+            float(positive.min()), 180.0,
+            -180.0, float(negative.max()),
+        )
+
+    return lat_min, lat_max, float(lons.min()), float(lons.max())
 
 
 def run_pipeline(
