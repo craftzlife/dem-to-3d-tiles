@@ -65,7 +65,7 @@ def generate_cell_heightmap(
 
     # Create UV grid within cell bounds
     u_vals = np.linspace(u_min, u_max, resolution)
-    v_vals = np.linspace(v_min, v_max, resolution)
+    v_vals = np.linspace(v_max, v_min, resolution)  # top-to-bottom so north is up
     u_grid, v_grid = np.meshgrid(u_vals, v_vals)  # (res, res) each
 
     # Convert UV to lat/lon for DEM sampling

@@ -3,11 +3,23 @@ services:
     build: .
     volumes:
       - ./data/raw:/app/data/raw:ro
+      - ./data/merged:/app/data/merged
       - ./data/processed:/app/data/processed
       - ./src:/app/src
     environment:
       - PYTHONUNBUFFERED=1
     command: ["process", "--input-dir", "/app/data/raw", "--output-dir", "/app/data/processed"]
+
+  merge-geotiffs:
+    build: .
+    volumes:
+      - ./data/raw:/app/data/raw:ro
+      - ./data/merged:/app/data/merged
+      - ./scripts:/app/scripts
+    entrypoint: ["python3", "scripts/merge_geotiffs.py"]
+    command: ["/app/data/raw", "/app/data/merged/dem_merged.tif"]
+    environment:
+      - PYTHONUNBUFFERED=1
 
   test:
     build: .
