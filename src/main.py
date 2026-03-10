@@ -4,14 +4,14 @@ import logging
 
 import click
 
-from .config import ELEVATION_SCALE, MAX_LOD, MESH_RESOLUTION, MIN_LOD, SPHERE_RADIUS
+from .config import MAX_LOD, MESH_RESOLUTION, MIN_LOD, SPHERE_RADIUS
 from .pipeline import run_pipeline
 
 
 @click.group()
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def cli(verbose: bool):
-    """Convert Copernicus DEM GeoTIFF to cube-sphere terrain mesh tiles."""
+    """Convert Copernicus DEM GeoTIFF to cube-sphere terrain heightmap tiles."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -31,7 +31,7 @@ def cli(verbose: bool):
     "--output-dir",
     type=click.Path(),
     required=True,
-    help="Output directory for mesh tiles.",
+    help="Output directory for heightmap tiles.",
 )
 @click.option("--min-lod", type=int, default=MIN_LOD, help="Minimum LOD level.")
 @click.option("--max-lod", type=int, default=MAX_LOD, help="Maximum LOD level.")
@@ -39,19 +39,13 @@ def cli(verbose: bool):
     "--resolution",
     type=int,
     default=MESH_RESOLUTION,
-    help="Mesh vertices per cell edge.",
+    help="Heightmap pixels per cell edge.",
 )
 @click.option(
     "--sphere-radius",
     type=float,
     default=SPHERE_RADIUS,
     help="Sphere radius in output units.",
-)
-@click.option(
-    "--elevation-scale",
-    type=float,
-    default=ELEVATION_SCALE,
-    help="Elevation exaggeration factor.",
 )
 @click.option(
     "--faces",
@@ -66,10 +60,9 @@ def process(
     max_lod: int,
     resolution: int,
     sphere_radius: float,
-    elevation_scale: float,
     faces: str | None,
 ):
-    """Process DEM data into cube-sphere terrain mesh tiles."""
+    """Process DEM data into cube-sphere terrain heightmap tiles."""
     face_list = None
     if faces is not None:
         face_list = [int(f.strip()) for f in faces.split(",")]
@@ -81,7 +74,6 @@ def process(
         max_lod=max_lod,
         resolution=resolution,
         sphere_radius=sphere_radius,
-        elevation_scale=elevation_scale,
         faces=face_list,
     )
 

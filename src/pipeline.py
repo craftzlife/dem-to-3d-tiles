@@ -1,7 +1,7 @@
 """
 Main processing pipeline.
 
-Orchestrates: DEM indexing → cell enumeration → mesh generation → tile writing.
+Orchestrates: DEM indexing -> cell enumeration -> heightmap generation -> tile writing.
 Only generates tiles for cells that overlap with available DEM data.
 """
 
@@ -14,7 +14,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from .config import (
-    ELEVATION_SCALE,
+    ELEVATION_BASE_SCALE,
     MAX_LOD,
     MESH_RESOLUTION,
     MIN_LOD,
@@ -23,7 +23,7 @@ from .config import (
 )
 from .cube_sphere import face_uv_to_latlng
 from .dem_reader import DEMReader
-from .mesh_generator import generate_cell_mesh
+from .heightmap_generator import generate_cell_heightmap
 from .quadtree import Cell, iter_cells_at_level
 from .tile_writer import write_manifest, write_tile
 
@@ -69,7 +69,6 @@ def run_pipeline(
     max_lod: int = MAX_LOD,
     resolution: int = MESH_RESOLUTION,
     sphere_radius: float = SPHERE_RADIUS,
-    elevation_scale: float = ELEVATION_SCALE,
     faces: list[int] | None = None,
 ) -> dict:
     """
@@ -77,12 +76,11 @@ def run_pipeline(
 
     Args:
         input_dir: Directory containing DEM GeoTIFF files.
-        output_dir: Directory for output mesh tiles.
+        output_dir: Directory for output heightmap tiles.
         min_lod: Minimum LOD level to generate.
         max_lod: Maximum LOD level to generate.
-        resolution: Mesh resolution (vertices per cell edge).
-        sphere_radius: Output sphere radius.
-        elevation_scale: Elevation exaggeration factor.
+        resolution: Heightmap resolution (pixels per cell edge).
+        sphere_radius: Output sphere radius (stored in manifest for Unity).
         faces: List of face indices to process (default: all 6).
 
     Returns:
@@ -133,15 +131,13 @@ def run_pipeline(
                     total_skipped += 1
                     continue
 
-                # Generate and write mesh
-                mesh = generate_cell_mesh(
+                # Generate and write heightmap
+                heightmap = generate_cell_heightmap(
                     cell,
                     dem_reader,
                     resolution=resolution,
-                    sphere_radius=sphere_radius,
-                    elevation_scale=elevation_scale,
                 )
-                tile_path = write_tile(mesh, cell, output_dir)
+                tile_path = write_tile(heightmap, cell, output_dir)
 
                 manifest_tiles.append(
                     {
@@ -150,8 +146,9 @@ def run_pipeline(
                         "ix": cell.ix,
                         "iy": cell.iy,
                         "path": str(tile_path.relative_to(output_dir)),
-                        "vertices": mesh.vertex_count,
-                        "triangles": mesh.triangle_count,
+                        "elevation_min": round(heightmap.elevation_min, 2),
+                        "elevation_max": round(heightmap.elevation_max, 2),
+                        "elevation_mean": round(heightmap.elevation_mean, 2),
                     }
                 )
                 level_generated += 1
@@ -166,9 +163,11 @@ def run_pipeline(
     )
 
     manifest = {
-        "version": "1.0",
+        "version": "2.0",
+        "format": "exr",
+        "elevation_unit": "meters",
         "sphere_radius": sphere_radius,
-        "elevation_scale": elevation_scale,
+        "elevation_base_scale": ELEVATION_BASE_SCALE,
         "resolution": resolution,
         "lod_range": [min_lod, max_lod],
         "tile_count": total_generated,

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Converts Copernicus DEM 30M GeoTIFF elevation data into cube-sphere terrain mesh tiles for a Unity anime-styled global map. The globe is projected onto 6 cube faces using S2 geometry principles, with quadtree-based multi-LOD subdivision.
+Converts Copernicus DEM 30M GeoTIFF elevation data into cube-sphere terrain heightmap tiles (EXR format) for a Unity anime-styled global map. The globe is projected onto 6 cube faces using S2 geometry principles, with quadtree-based multi-LOD subdivision. Mesh reconstruction is deferred to the Unity client.
 
 ## Build & Run (Docker)
 
@@ -44,7 +44,7 @@ The Docker image is based on `osgeo/gdal:ubuntu-small-3.8.4` which provides GDAL
 ### Processing Pipeline (`src/pipeline.py`)
 
 ```
-DEM GeoTIFFs → DEMReader index → enumerate cells per LOD → filter by data overlap → generate mesh → write OBJ tile
+DEM GeoTIFFs → DEMReader index → enumerate cells per LOD → filter by data overlap → generate heightmap → write EXR tile
 ```
 
 The pipeline only generates tiles for quadtree cells that overlap with available DEM data, skipping empty ocean/no-data regions.
@@ -69,18 +69,18 @@ The forward/inverse transforms are exact inverses — verified by roundtrip test
 - `cell.children` → 4 child cells, `cell.parent` → parent cell
 - `cell.tile_path` → output directory path like `face_0_pos_x/lod_3/5_7`
 
-### Mesh Generation (`src/mesh_generator.py`)
+### Heightmap Generation (`src/heightmap_generator.py`)
 
-For each cell: creates a UV grid → samples DEM elevation via lat/lon lookup → positions vertices on the cube-sphere surface with radial elevation displacement. Elevation is scaled by `ELEVATION_BASE_SCALE * ELEVATION_SCALE * SPHERE_RADIUS` to convert meters to exaggerated Unity units.
+For each cell: creates a UV grid → converts to lat/lon via cube-sphere projection → samples DEM elevation. Outputs a `Heightmap` dataclass containing a float32 elevation grid (in meters). Mesh reconstruction (vertices, normals, triangles) is deferred to the Unity client using the cube-sphere projection + heightmap data.
 
 ### Key Configuration (`src/config.py`)
 
 | Constant | Default | Purpose |
 |----------|---------|---------|
 | `SPHERE_RADIUS` | 100.0 | Unity-space sphere radius |
-| `ELEVATION_SCALE` | 30.0 | Terrain exaggeration for anime style |
-| `MAX_LOD` | 7 | Deepest quadtree level |
-| `MESH_RESOLUTION` | 64 | Vertices per cell edge (64×64 grid) |
+| `ELEVATION_SCALE` | 5.0 | Terrain exaggeration for anime style |
+| `MAX_LOD` | 14 | Deepest quadtree level |
+| `MESH_RESOLUTION` | 256 | Pixels per cell edge (256×256 grid) |
 
 ### Output Structure
 
@@ -88,12 +88,12 @@ For each cell: creates a UV grid → samples DEM elevation via lat/lon lookup �
 data/processed/
 ├── manifest.json              # Tile hierarchy + metadata
 └── face_0_pos_x/
-    ├── lod_0/0_0.obj          # Full-face mesh
-    ├── lod_1/0_0.obj .. 1_1.obj
-    └── lod_N/ix_iy.obj
+    ├── lod_0/0_0.exr          # Full-face heightmap
+    ├── lod_1/0_0.exr .. 1_1.exr
+    └── lod_N/ix_iy.exr
 ```
 
-Each OBJ contains vertices (with elevation), normals, UVs, and triangle faces. The manifest.json lists all generated tiles with their cell coordinates and mesh stats.
+Each EXR is a single-channel ("Y") float32 image storing elevation in meters. The manifest.json lists all generated tiles with their cell coordinates and elevation statistics (min, max, mean).
 
 ### DEM Reader (`src/dem_reader.py`)
 
@@ -102,5 +102,5 @@ Indexes all `.tif` files by geographic bounds on init. Provides `get_elevation(l
 ## Data
 
 - **Input**: `data/raw/` — Copernicus DEM 30M COG GeoTIFF tiles (1°×1° each, ~30m resolution)
-- **Output**: `data/processed/` — OBJ mesh tiles + manifest.json
+- **Output**: `data/processed/` — EXR heightmap tiles + manifest.json
 - Both directories are gitignored; only code is tracked

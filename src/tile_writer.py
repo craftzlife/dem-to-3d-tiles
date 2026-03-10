@@ -1,5 +1,5 @@
 """
-Tile writer: saves terrain meshes to OBJ files with metadata.
+Tile writer: saves terrain heightmaps to EXR files with metadata.
 """
 
 from __future__ import annotations
@@ -8,53 +8,36 @@ import json
 import logging
 from pathlib import Path
 
-from .mesh_generator import Mesh
+import numpy as np
+import OpenEXR
+
+from .heightmap_generator import Heightmap
 from .quadtree import Cell
 
 logger = logging.getLogger(__name__)
 
 
-def write_obj(mesh: Mesh, path: Path) -> None:
-    """Write a mesh to Wavefront OBJ format."""
+def write_exr(heightmap: Heightmap, path: Path) -> None:
+    """Write a heightmap to a single-channel float32 EXR file."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(path, "w") as f:
-        f.write(f"# Terrain mesh: {path.stem}\n")
-        f.write(f"# Vertices: {mesh.vertex_count}, Triangles: {mesh.triangle_count}\n\n")
+    resolution = heightmap.resolution
+    elevations = heightmap.elevations.astype(np.float32)
 
-        # Vertices
-        for i in range(mesh.vertex_count):
-            v = mesh.vertices[i]
-            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
-
-        f.write("\n")
-
-        # Texture coordinates
-        for i in range(mesh.vertex_count):
-            uv = mesh.uvs[i]
-            f.write(f"vt {uv[0]:.6f} {uv[1]:.6f}\n")
-
-        f.write("\n")
-
-        # Normals
-        for i in range(mesh.vertex_count):
-            n = mesh.normals[i]
-            f.write(f"vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n")
-
-        f.write("\n")
-
-        # Faces (1-indexed, with texture coords and normals)
-        for i in range(mesh.triangle_count):
-            t = mesh.triangles[i]
-            i0, i1, i2 = t[0] + 1, t[1] + 1, t[2] + 1
-            f.write(f"f {i0}/{i0}/{i0} {i1}/{i1}/{i1} {i2}/{i2}/{i2}\n")
+    header = {
+        "compression": OpenEXR.ZIP_COMPRESSION,
+        "type": OpenEXR.scanlineimage,
+    }
+    channels = {"Y": elevations}
+    exr = OpenEXR.File(header, channels)
+    exr.write(str(path))
 
 
-def write_tile(mesh: Mesh, cell: Cell, output_dir: Path) -> Path:
-    """Write a mesh tile and return the output file path."""
-    rel_path = cell.tile_path + ".obj"
+def write_tile(heightmap: Heightmap, cell: Cell, output_dir: Path) -> Path:
+    """Write a heightmap tile and return the output file path."""
+    rel_path = cell.tile_path + ".exr"
     out_path = output_dir / rel_path
-    write_obj(mesh, out_path)
+    write_exr(heightmap, out_path)
     logger.debug(f"Wrote tile: {rel_path}")
     return out_path
 

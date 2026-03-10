@@ -3,6 +3,9 @@ FROM ghcr.io/osgeo/gdal:ubuntu-small-3.8.4
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-dev \
+    cmake \
+    g++ \
+    libdeflate-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
