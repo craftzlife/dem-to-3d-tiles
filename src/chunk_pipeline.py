@@ -187,7 +187,7 @@ def process_global(
             continue
 
         logger.info(
-            f"Chunk {i}/{total}: lat {bbox[0]}-{bbox[2]}, lon {bbox[1]}-{bbox[3]}"
+            f"Chunk {i}/{total}: bbox={bbox}"
         )
 
         process_chunk(
