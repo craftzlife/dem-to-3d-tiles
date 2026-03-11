@@ -11,7 +11,7 @@ import logging
 import multiprocessing
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +41,9 @@ _worker_dem_reader: DEMReader | None = None
 def _init_worker(input_dir: str) -> None:
     """Pool initializer: create a process-local DEMReader (no shared state)."""
     global _worker_dem_reader
+    logger.info(f"Worker {os.getpid()} indexing DEM tiles...")
     _worker_dem_reader = DEMReader(input_dir)
+    logger.info(f"Worker {os.getpid()} ready ({len(_worker_dem_reader.tiles)} tiles indexed)")
     # Note: no atexit needed — ProcessPoolExecutor workers exit via os._exit(0),
     # which bypasses Python cleanup (and stuck GDAL background threads).
 
@@ -254,26 +256,25 @@ def run_pipeline(
             _worker_dem_reader = None
     else:
         ctx = multiprocessing.get_context("spawn")
-        # chunksize batches work per IPC round-trip; 64 balances latency vs memory.
-        # executor.map() is lazy — unlike submit(), it does NOT pre-allocate
-        # millions of Future objects, so tqdm starts updating immediately.
-        chunksize = max(1, len(work_args) // (num_workers * 16))
         with ProcessPoolExecutor(
             max_workers=num_workers,
             mp_context=ctx,
             initializer=_init_worker,
             initargs=(str(input_dir),),
         ) as executor:
-            for result in tqdm(
-                executor.map(_process_cell, work_args, chunksize=chunksize),
-                total=len(work_args),
-                desc="Processing cells",
-            ):
-                if result is None:
-                    total_skipped += 1
-                else:
-                    manifest_tiles.append(result)
-                    total_generated += 1
+            futures = {
+                executor.submit(_process_cell, args): args
+                for args in work_args
+            }
+            with tqdm(total=len(futures), desc="Processing cells") as pbar:
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is None:
+                        total_skipped += 1
+                    else:
+                        manifest_tiles.append(result)
+                        total_generated += 1
+                    pbar.update(1)
         # ProcessPoolExecutor.__exit__ calls shutdown(wait=True) which sends a
         # sentinel to each worker causing them to call os._exit(0), cleanly
         # bypassing any stuck GDAL C-level background threads.
