@@ -30,7 +30,7 @@ from .cube_sphere import face_uv_to_latlng_batch
 from .dem_reader import DEMReader
 from .heightmap_generator import generate_cell_heightmap
 from .quadtree import Cell, iter_cells_at_level
-from .tile_writer import write_manifest, write_tile
+from .tile_writer import load_manifest, merge_manifest, write_manifest, write_tile
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,43 @@ def _cell_latlng_bounds(
     return lat_min, lat_max, float(lons.min()), float(lons.max())
 
 
+def _ranges_overlap(a_min: float, a_max: float, b_min: float, b_max: float) -> bool:
+    """Check if two 1D ranges overlap."""
+    return a_min < b_max and b_min < a_max
+
+
+def _cell_intersects_bbox(
+    cell: Cell, bbox: tuple[float, float, float, float]
+) -> bool:
+    """
+    Check if a cell's geographic footprint intersects the given BBOX.
+
+    Args:
+        cell: Quadtree cell.
+        bbox: (lat_min, lon_min, lat_max, lon_max) in degrees.
+
+    Returns:
+        True if the cell intersects the BBOX.
+    """
+    bbox_lat_min, bbox_lon_min, bbox_lat_max, bbox_lon_max = bbox
+    bounds = _cell_latlng_bounds(cell)
+
+    if len(bounds) == 6:
+        lat_min, lat_max, lon_min1, lon_max1, lon_min2, lon_max2 = bounds
+        if not _ranges_overlap(lat_min, lat_max, bbox_lat_min, bbox_lat_max):
+            return False
+        return (
+            _ranges_overlap(lon_min1, lon_max1, bbox_lon_min, bbox_lon_max)
+            or _ranges_overlap(lon_min2, lon_max2, bbox_lon_min, bbox_lon_max)
+        )
+    else:
+        lat_min, lat_max, lon_min, lon_max = bounds
+        return (
+            _ranges_overlap(lat_min, lat_max, bbox_lat_min, bbox_lat_max)
+            and _ranges_overlap(lon_min, lon_max, bbox_lon_min, bbox_lon_max)
+        )
+
+
 def run_pipeline(
     input_dir: str | Path,
     output_dir: str | Path,
@@ -139,6 +176,7 @@ def run_pipeline(
     sphere_radius: float = SPHERE_RADIUS,
     faces: list[int] | None = None,
     num_workers: int | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> dict:
     """
     Run the full DEM-to-tiles pipeline.
@@ -153,13 +191,19 @@ def run_pipeline(
         faces: List of face indices to process (default: all 6).
         num_workers: Number of parallel worker processes. Defaults to
             min(os.cpu_count(), 8). Use 1 for sequential/debug mode.
+        bbox: Optional (lat_min, lon_min, lat_max, lon_max) to restrict
+            processing to cells intersecting this geographic bounding box.
 
     Returns:
         Manifest dictionary with tile hierarchy metadata.
     """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        if not output_dir.is_dir():
+            raise
 
     if faces is None:
         faces = list(range(NUM_FACES))
@@ -181,6 +225,11 @@ def run_pipeline(
         for face in faces:
             all_cells.extend(iter_cells_at_level(face, level))
     all_cells.sort(key=lambda c: (c.face, c.level, c.iy, c.ix))
+
+    if bbox is not None:
+        before = len(all_cells)
+        all_cells = [c for c in all_cells if _cell_intersects_bbox(c, bbox)]
+        logger.info(f"BBOX filter: {before} -> {len(all_cells)} cells")
 
     output_dir_str = str(output_dir)
     work_args = [(cell, output_dir_str, resolution) for cell in all_cells]
@@ -235,6 +284,14 @@ def run_pipeline(
         f"{total_skipped} skipped, {elapsed:.1f}s elapsed"
     )
 
+    # Merge with existing manifest if present (incremental/chunked processing)
+    existing_manifest = load_manifest(output_dir)
+    if existing_manifest is not None:
+        manifest_tiles = merge_manifest(existing_manifest, manifest_tiles)
+        logger.info(
+            f"Merged with existing manifest: {len(manifest_tiles)} total tiles"
+        )
+
     manifest = {
         "version": "2.0",
         "format": "exr",
@@ -243,7 +300,7 @@ def run_pipeline(
         "elevation_base_scale": ELEVATION_BASE_SCALE,
         "resolution": resolution,
         "lod_range": [min_lod, max_lod],
-        "tile_count": total_generated,
+        "tile_count": len(manifest_tiles),
         "tiles": manifest_tiles,
     }
 

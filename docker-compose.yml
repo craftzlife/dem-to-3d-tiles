@@ -4,6 +4,7 @@ services:
     volumes:
       - ./data/raw:/app/data/raw:ro
       - ./data/merged:/app/data/merged
+      - ./data/download:/app/data/download
       - ./data/processed:/app/data/processed
       - ./src:/app/src
     environment:
@@ -20,6 +21,26 @@ services:
     command: ["/app/data/raw", "/app/data/merged/dem_merged.tif"]
     environment:
       - PYTHONUNBUFFERED=1
+
+  process-chunk:
+    build: .
+    volumes:
+      - ./data/download:/app/data/download
+      - ./data/processed:/app/data/processed
+      - ./src:/app/src
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["process-chunk", "--bbox", "0,0,15,15", "--download-dir", "/app/data/download", "--output-dir", "/app/data/processed"]
+
+  process-global:
+    build: .
+    volumes:
+      - ./data/download:/app/data/download
+      - ./data/processed:/app/data/processed
+      - ./src:/app/src
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["process-global", "--download-dir", "/app/data/download", "--output-dir", "/app/data/processed"]
 
   test:
     build: .

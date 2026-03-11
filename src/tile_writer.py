@@ -42,6 +42,35 @@ def write_tile(heightmap: Heightmap, cell: Cell, output_dir: Path) -> Path:
     return out_path
 
 
+def load_manifest(output_dir: Path) -> dict | None:
+    """Load existing manifest.json if present, return None otherwise."""
+    manifest_path = output_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    with open(manifest_path) as f:
+        return json.load(f)
+
+
+def merge_manifest(existing: dict, new_tiles: list[dict]) -> list[dict]:
+    """
+    Merge new tiles into an existing manifest's tile list.
+
+    Tiles are keyed by (face, level, ix, iy). New tiles overwrite existing
+    entries with the same key (supports re-processing).
+
+    Returns:
+        Merged list of tile dicts.
+    """
+    tiles_by_key: dict[tuple, dict] = {}
+    for tile in existing.get("tiles", []):
+        key = (tile["face"], tile["level"], tile["ix"], tile["iy"])
+        tiles_by_key[key] = tile
+    for tile in new_tiles:
+        key = (tile["face"], tile["level"], tile["ix"], tile["iy"])
+        tiles_by_key[key] = tile
+    return list(tiles_by_key.values())
+
+
 def write_manifest(
     manifest_data: dict,
     output_dir: Path,

@@ -7,6 +7,7 @@ and provides elevation lookup by lat/lon coordinates.
 
 from __future__ import annotations
 
+import collections
 import logging
 import math
 from dataclasses import dataclass, field
@@ -39,12 +40,19 @@ class TileInfo:
 class DEMReader:
     """Reads elevation data from a directory of Copernicus DEM GeoTIFF tiles."""
 
+    # Maximum number of tile bands to keep in memory at once.
+    # Each Copernicus 30M tile is ~49 MB (3601x3601 float32).
+    # Default 32 tiles ≈ ~1.6 GB per worker process.
+    MAX_CACHED_BANDS = 32
+
     def __init__(self, input_dir: str | Path):
         self.input_dir = Path(input_dir)
         self.tiles: list[TileInfo] = []
         self._open_datasets: dict[Path, rasterio.DatasetReader] = {}
-        # Band cache: stores the full elevation array for each opened tile path
-        self._band_cache: dict[Path, np.ndarray] = {}
+        # LRU band cache: evicts least-recently-used tiles when full
+        self._band_cache: collections.OrderedDict[Path, np.ndarray] = (
+            collections.OrderedDict()
+        )
         # Spatial index: (floor_lat, floor_lon) -> list of TileInfo
         self._spatial_index: dict[tuple[int, int], list[TileInfo]] = {}
         self._index_tiles()
@@ -130,17 +138,43 @@ class DEMReader:
             self._open_datasets[tile.path] = rasterio.open(tile.path)
         return self._open_datasets[tile.path]
 
-    def _get_band(self, tile: TileInfo) -> np.ndarray:
+    def _get_band(self, tile: TileInfo) -> np.ndarray | None:
         """
         Return the full elevation band for a tile, reading and caching on first access.
 
         Each tile is ~49 MB (3601×3601 float32). Adjacent cells frequently share
-        the same tile, so caching avoids repeated full-band reads.
+        the same tile, so caching avoids repeated full-band reads. Uses LRU
+        eviction to cap memory at MAX_CACHED_BANDS tiles.
+
+        Returns None if the tile is corrupt or unreadable.
         """
-        if tile.path not in self._band_cache:
+        if tile.path in self._band_cache:
+            # Move to end (most recently used)
+            self._band_cache.move_to_end(tile.path)
+            return self._band_cache[tile.path]
+
+        try:
             ds = self._get_dataset(tile)
-            self._band_cache[tile.path] = ds.read(1)
-        return self._band_cache[tile.path]
+            band = ds.read(1)
+        except Exception as e:
+            logger.warning(f"Corrupt tile, skipping: {tile.path} ({e})")
+            # Close and remove the bad dataset so we don't retry it
+            bad_ds = self._open_datasets.pop(tile.path, None)
+            if bad_ds is not None:
+                bad_ds.close()
+            return None
+
+        self._band_cache[tile.path] = band
+
+        # Evict oldest entries if over limit
+        while len(self._band_cache) > self.MAX_CACHED_BANDS:
+            evicted_path, _ = self._band_cache.popitem(last=False)
+            # Also close the dataset to free the file handle
+            evicted_ds = self._open_datasets.pop(evicted_path, None)
+            if evicted_ds is not None:
+                evicted_ds.close()
+
+        return band
 
     def get_elevation(self, lat: float, lon: float) -> float:
         """Get elevation at a single lat/lon point. Returns 0.0 if no data."""
@@ -148,11 +182,15 @@ class DEMReader:
         if tile is None:
             return 0.0
 
+        band = self._get_band(tile)
+        if band is None:
+            return 0.0
+
         ds = self._get_dataset(tile)
         row, col = rowcol(ds.transform, lon, lat)
 
         if 0 <= row < ds.height and 0 <= col < ds.width:
-            val = ds.read(1, window=((row, row + 1), (col, col + 1)))[0, 0]
+            val = band[row, col]
             if val == DEM_NODATA or np.isnan(val):
                 return 0.0
             return float(val)
@@ -216,6 +254,8 @@ class DEMReader:
 
                 if np.any(valid):
                     band = self._get_band(tile)
+                    if band is None:
+                        continue
                     v_rows = rows[valid]
                     v_cols = cols[valid]
                     vals = band[v_rows, v_cols].astype(np.float64)
