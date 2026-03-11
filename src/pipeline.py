@@ -28,9 +28,9 @@ from .config import (
 )
 from .cube_sphere import face_uv_to_latlng_batch
 from .dem_reader import DEMReader
-from .heightmap_generator import generate_cell_heightmap
+from .heightmap_generator import Heightmap, generate_cell_heightmap
 from .quadtree import Cell, iter_cells_at_level
-from .tile_writer import load_manifest, merge_manifest, write_manifest, write_tile
+from .tile_writer import load_manifest, merge_manifest, read_exr, write_manifest, write_tile
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +75,20 @@ def _process_cell(args: tuple[Any, ...]) -> dict | None:
         if not dem_reader.has_data_in_region(lat_min, lat_max, lon_min, lon_max):
             return None
 
-    # Generate and write heightmap
+    # Generate heightmap
     heightmap = generate_cell_heightmap(cell, dem_reader, resolution=resolution)
+
+    # Merge with existing tile if present (chunked processing: cells can span
+    # multiple geographic chunks, so we accumulate elevation data across runs)
+    existing_path = output_dir / (cell.tile_path + ".exr")
+    existing_data = read_exr(existing_path)
+    if existing_data is not None and existing_data.shape == heightmap.elevations.shape:
+        merged = np.where(np.isnan(heightmap.elevations), existing_data, heightmap.elevations)
+        heightmap = Heightmap(elevations=merged)
+
+    # Replace remaining NaN (no DEM coverage from any chunk) with 0.0
+    heightmap = Heightmap(elevations=np.nan_to_num(heightmap.elevations, nan=0.0))
+
     tile_path = write_tile(heightmap, cell, output_dir)
 
     return {

@@ -42,6 +42,18 @@ def write_tile(heightmap: Heightmap, cell: Cell, output_dir: Path) -> Path:
     return out_path
 
 
+def read_exr(path: Path) -> np.ndarray | None:
+    """Read a single-channel EXR file and return the Y channel as float32 array."""
+    if not path.exists():
+        return None
+    try:
+        with OpenEXR.File(str(path)) as f:
+            return np.asarray(f.channels()["Y"].pixels, dtype=np.float32)
+    except Exception as e:
+        logger.warning(f"Failed to read EXR {path}: {e}")
+        return None
+
+
 def load_manifest(output_dir: Path) -> dict | None:
     """Load existing manifest.json if present, return None otherwise."""
     manifest_path = output_dir / "manifest.json"

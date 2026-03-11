@@ -205,7 +205,7 @@ class DEMReader:
 
         Returns array of elevations in meters. Missing data returns 0.0.
         """
-        result = np.zeros(lats.shape, dtype=np.float64)
+        result = np.full(lats.shape, np.nan, dtype=np.float64)
         flat_lats = lats.ravel()
         flat_lons = lons.ravel()
         flat_result = result.ravel()
