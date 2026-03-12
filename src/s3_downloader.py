@@ -8,6 +8,7 @@ No AWS credentials required (public bucket with unsigned access).
 from __future__ import annotations
 
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import boto3
 import botocore
 from botocore import UNSIGNED
 from botocore.config import Config
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -100,27 +102,54 @@ def download_chunk(
     downloaded: list[Path] = []
     max_retries = 3
 
-    def _download_one(lat: int, lon: int) -> Path | None:
+    # Fetch content lengths to set up a byte-level progress bar
+    total_bytes = 0
+    tiles_with_size: list[tuple[int, int, int]] = []
+    for lat, lon in tiles_to_download:
         key = copernicus_tile_key(lat, lon)
         filename = key.split("/")[-1]
         local_path = output_dir / filename
         if local_path.exists():
-            logger.debug(f"Already exists: {filename}")
-            return local_path
+            downloaded.append(local_path)
+            continue
+        try:
+            head = s3_client.head_object(Bucket=bucket, Key=key)
+            size = head["ContentLength"]
+            tiles_with_size.append((lat, lon, size))
+            total_bytes += size
+        except botocore.exceptions.ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code in ("404", "NoSuchKey"):
+                logger.debug(f"Not found (ocean/no data): {key}")
+            else:
+                # Still attempt download later; size unknown
+                tiles_with_size.append((lat, lon, 0))
+
+    progress_bar = tqdm(
+        total=total_bytes,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        desc="Downloading DEM tiles",
+        disable=not tiles_with_size,
+    )
+    progress_lock = threading.Lock()
+
+    def _download_one(lat: int, lon: int, expected_size: int) -> Path | None:
+        key = copernicus_tile_key(lat, lon)
+        filename = key.split("/")[-1]
+        local_path = output_dir / filename
 
         for attempt in range(1, max_retries + 1):
             try:
-                # Use get_object instead of download_file to avoid s3transfer
-                # spawning extra threads that exhaust the connection pool.
                 response = s3_client.get_object(Bucket=bucket, Key=key)
-                # Write to a temp file first, then rename atomically.
-                # This prevents interrupted downloads from leaving corrupt
-                # files that the resume logic would skip.
                 tmp_path = local_path.with_suffix(".tif.tmp")
                 try:
                     with open(tmp_path, "wb") as f:
                         for chunk in response["Body"].iter_chunks(1024 * 1024):
                             f.write(chunk)
+                            with progress_lock:
+                                progress_bar.update(len(chunk))
                     tmp_path.rename(local_path)
                 except BaseException:
                     tmp_path.unlink(missing_ok=True)
@@ -146,16 +175,18 @@ def download_chunk(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(_download_one, lat, lon): (lat, lon)
-            for lat, lon in tiles_to_download
+            executor.submit(_download_one, lat, lon, size): (lat, lon)
+            for lat, lon, size in tiles_with_size
         }
         for future in as_completed(futures):
             result = future.result()
             if result is not None:
                 downloaded.append(result)
 
+    progress_bar.close()
+
     logger.info(
-        f"Downloaded {len(downloaded)}/{len(tiles_to_download)} tiles for bbox={bbox}"
+        f"Ready {len(downloaded)}/{len(tiles_to_download)} tiles for bbox={bbox}"
     )
     return downloaded
 
