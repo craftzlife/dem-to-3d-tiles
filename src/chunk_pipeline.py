@@ -56,6 +56,16 @@ def _bbox_key(bbox: tuple[float, float, float, float]) -> str:
     return ",".join(str(v) for v in bbox)
 
 
+def _bbox_folder(bbox: tuple[float, float, float, float]) -> str:
+    """Convert a BBOX to a folder name like 'S90_00_W180_00-S75_00_W165_00-DEM'."""
+    def _coord(lat: float, lon: float) -> str:
+        lat_p = "N" if lat >= 0 else "S"
+        lon_p = "E" if lon >= 0 else "W"
+        return f"{lat_p}{abs(int(lat)):02d}_00_{lon_p}{abs(int(lon)):03d}_00"
+    lat_min, lon_min, lat_max, lon_max = bbox
+    return f"{_coord(lat_min, lon_min)}-{_coord(lat_max, lon_max)}-DEM"
+
+
 def _load_progress(output_dir: Path) -> set[str]:
     """Load set of completed bbox keys from progress.json."""
     progress_path = output_dir / "progress.json"
@@ -107,17 +117,20 @@ def process_chunk(
     download_dir = Path(download_dir)
     output_dir = Path(output_dir)
 
+    # Each chunk gets its own subfolder for easy backup/reuse
+    chunk_download_dir = download_dir / _bbox_folder(bbox)
+
     logger.info(f"Processing chunk: bbox={bbox}")
 
     # Download DEM tiles for this BBOX
-    downloaded = download_chunk(bbox, download_dir)
+    downloaded = download_chunk(bbox, chunk_download_dir)
     if not downloaded:
         logger.info(f"No DEM tiles found for bbox={bbox}, skipping")
         return None
 
     # Run pipeline with BBOX filtering
     manifest = run_pipeline(
-        input_dir=download_dir,
+        input_dir=chunk_download_dir,
         output_dir=output_dir,
         min_lod=min_lod,
         max_lod=max_lod,
@@ -130,7 +143,7 @@ def process_chunk(
 
     # Clean up downloaded files
     if cleanup:
-        cleanup_chunk(download_dir)
+        cleanup_chunk(chunk_download_dir)
 
     return manifest
 

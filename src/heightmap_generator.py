@@ -63,9 +63,14 @@ def generate_cell_heightmap(
     u_min, u_max = cell.u_range
     v_min, v_max = cell.v_range
 
-    # Create UV grid within cell bounds
-    u_vals = np.linspace(u_min, u_max, resolution)
-    v_vals = np.linspace(v_max, v_min, resolution)  # top-to-bottom so north is up
+    # Create UV grid within cell bounds, sampling at pixel centers.
+    # This avoids duplicated boundary samples between adjacent tiles:
+    # pixel i samples at u_min + (i + 0.5) * step, giving uniform spacing
+    # when tiles are concatenated.
+    u_step = (u_max - u_min) / resolution
+    v_step = (v_max - v_min) / resolution
+    u_vals = np.linspace(u_min + u_step / 2, u_max - u_step / 2, resolution)
+    v_vals = np.linspace(v_max - v_step / 2, v_min + v_step / 2, resolution)  # top-to-bottom so north is up
     u_grid, v_grid = np.meshgrid(u_vals, v_vals)  # (res, res) each
 
     # Convert UV to lat/lon for DEM sampling
