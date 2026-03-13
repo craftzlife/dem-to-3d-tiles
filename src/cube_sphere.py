@@ -1,15 +1,26 @@
 """
-S2-inspired cube-sphere projection.
+Cube-sphere projection with uniform UV convention.
 
 Maps between geographic coordinates (lat/lon) and cube-face coordinates (face, u, v).
-Uses gnomonic projection onto 6 cube faces, following S2 geometry conventions.
+Uses gnomonic projection onto 6 cube faces.
 
-Face layout:
+Face layout (dominant axis):
     Face 0: +X    Face 3: -X
     Face 1: +Y    Face 4: -Y
     Face 2: +Z    Face 5: -Z
 
-UV coordinates are in [0, 1] range, mapped from the gnomonic [-1, 1] range.
+UV coordinates are in [0, 1] range, mapped linearly from gnomonic [-1, 1].
+
+FaceUVToXYZ mapping (s = 2u-1, t = 2v-1):
+    Face 0: ( 1,  s,  t)     Face 3: (-1, -s,  t)
+    Face 1: (-s,  1,  t)     Face 4: ( s, -1,  t)
+    Face 2: (-s,  t,  1)     Face 5: ( s, -t, -1)
+
+Note: This convention keeps the same u,v axis orientation across all faces
+(no axis rotation on negative faces). This differs from the standard S2
+Geometry convention which rotates axes on faces 3,4,5 for Hilbert curve
+continuity. Consumers that use S2 standard (e.g. Unity CubeSphere) must
+remap UVs when sampling these tiles.
 """
 
 import math

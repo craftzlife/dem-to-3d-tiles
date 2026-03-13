@@ -307,6 +307,14 @@ def run_pipeline(
 
     manifest = {
         "version": "2.0",
+        "projection": "cube_sphere_uniform_uv",
+        "projection_description": (
+            "Gnomonic cube-sphere projection with uniform UV axes. "
+            "6 faces indexed 0-5 (+X,+Y,+Z,-X,-Y,-Z). "
+            "Tile UV in [0,1], no axis rotation on negative faces. "
+            "See cube_sphere.face_uv_to_xyz for the exact mapping. "
+            "Consumers using S2 standard must remap UVs for faces 3,4,5."
+        ),
         "format": "exr",
         "elevation_unit": "meters",
         "sphere_radius": sphere_radius,
